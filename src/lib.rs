@@ -1,10 +1,13 @@
+use arr_macro::arr;
+use derivative::Derivative;
 use enr::*;
 use ethereum_types::*;
 use heapless::{
     consts::{U16, U4096},
     FnvIndexMap,
 };
-use std::{ops::BitXor, time::Instant};
+use log::*;
+use std::{ops::BitXor, ptr::NonNull, time::Instant};
 
 type RawNodeId = [u8; 32];
 
@@ -24,25 +27,36 @@ pub fn logdistance(a: H256, b: H256) -> Option<usize> {
     None // a and b are equal, so log distance is -inf
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug(bound = ""))]
 pub struct NodeEntry<K: EnrKey> {
     pub record: Enr<K>,
     pub liveness: Option<Instant>,
 }
 
+#[derive(Derivative)]
+#[derivative(Default(bound = ""))]
 struct Bucket<K: EnrKey> {
-    nodes: FnvIndexMap<RawNodeId, NodeEntry<K>, U16>,
+    nodes: Box<FnvIndexMap<RawNodeId, NodeEntry<K>, U16>>,
     recently_seen: Option<Enr<K>>,
 }
 
 pub struct NodeTable<K: EnrKey> {
     node_id: H256,
-    buckets: [Bucket<K>; 256],
+    buckets: Box<[Bucket<K>; 256]>,
 
-    all_nodes: heapless::FnvIndexSet<RawNodeId, U4096>,
+    all_nodes: Box<heapless::FnvIndexSet<RawNodeId, U4096>>,
 }
 
 impl<K: EnrKey> NodeTable<K> {
+    pub fn new(host_id: H256) -> Self {
+        Self {
+            node_id: host_id,
+            buckets: Box::new(arr![Default::default(); 256]),
+            all_nodes: Default::default(),
+        }
+    }
+
     fn bucket_idx(&self, node_id: H256) -> Option<usize> {
         logdistance(self.node_id, node_id)
     }
@@ -126,11 +140,23 @@ impl<K: EnrKey> NodeTable<K> {
         )
     }
 
+    pub fn bucket_nodes(&mut self, logdistance: u8) -> NodeEntries<'_, K> {
+        NodeEntries {
+            node_table: self,
+            current_bucket: logdistance as usize,
+            max_bucket: logdistance as usize,
+            current_bucket_remaining: None,
+            next_yield: 0,
+        }
+    }
+
     pub fn closest(&mut self) -> NodeEntries<'_, K> {
         NodeEntries {
             node_table: self,
             current_bucket: 0,
+            max_bucket: 255,
             current_bucket_remaining: None,
+            next_yield: 0,
         }
     }
 }
@@ -138,7 +164,9 @@ impl<K: EnrKey> NodeTable<K> {
 pub struct NodeEntries<'a, K: EnrKey> {
     node_table: &'a mut NodeTable<K>,
     current_bucket: usize,
-    current_bucket_remaining: Option<Vec<*mut NodeEntry<K>>>,
+    max_bucket: usize,
+    current_bucket_remaining: Option<Vec<NonNull<NodeEntry<K>>>>,
+    next_yield: usize,
 }
 
 impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
@@ -149,29 +177,74 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
             let NodeEntries {
                 node_table,
                 current_bucket,
+                max_bucket,
                 current_bucket_remaining,
+                next_yield,
             } = self;
 
-            if *current_bucket == node_table.buckets.len() {
+            if *current_bucket > *max_bucket {
                 return None;
             }
 
-            if let Some(v) = current_bucket_remaining
+            trace!("Current bucket is {}", *current_bucket);
+
+            let host_id = node_table.node_id;
+
+            if let Some(ptr) = current_bucket_remaining
                 .get_or_insert_with(|| {
-                    let nodes = node_table.buckets[*current_bucket]
+                    let mut nodes = node_table.buckets[*current_bucket]
                         .nodes
                         .values_mut()
-                        .map(|value| &mut *value as *mut _)
                         .collect::<Vec<_>>();
-                    nodes
+
+                    trace!("Nodes before sorting: {:?}", nodes);
+
+                    nodes.sort_by(|a, b| {
+                        distance(host_id, H256(a.record.node_id().raw()))
+                            .cmp(&distance(host_id, H256(b.record.node_id().raw())))
+                    });
+
+                    trace!("Nodes after sorting: {:?}", nodes);
+
+                    nodes.into_iter().map(From::from).collect()
                 })
-                .pop()
+                .get_mut(*next_yield)
             {
-                return Some(unsafe { v.as_mut().unwrap() });
+                *next_yield += 1;
+                return Some(unsafe { &mut *ptr.as_ptr() });
             }
 
             *current_bucket += 1;
             *current_bucket_remaining = None;
+            *next_yield = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::SecretKey;
+    #[test]
+    fn test_iterator() {
+        let _ = env_logger::init();
+        let host_id = H256::random();
+        let mut table = NodeTable::<SecretKey>::new(host_id);
+
+        for _ in 0..9000 {
+            table.add_node(
+                EnrBuilder::new("v4")
+                    .build(&SecretKey::random(&mut rand::thread_rng()))
+                    .unwrap(),
+            )
+        }
+
+        let mut max_distance = U256::zero();
+        for entry in table.closest() {
+            let dst = distance(host_id, H256(entry.record.node_id().raw()));
+            trace!("Computed distance is {}", dst);
+            assert!(dst >= max_distance);
+            max_distance = dst;
         }
     }
 }

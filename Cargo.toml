@@ -5,8 +5,15 @@ authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
 edition = "2018"
 
 [dependencies]
+arr_macro = "*"
+derivative = "1"
 enr = "0.1.0-alpha"
 ethereum-types = "*"
 heapless = "0.5"
+log = "*"
 rand = "0.7"
 tokio = { version = "0.2", features = ["full"] }
+
+[dev-dependencies]
+env_logger = "*"
+libsecp256k1 = "*"
