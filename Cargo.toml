@@ -1,0 +1,12 @@
+[package]
+name = "rust-devp2p-discv5"
+version = "0.1.0"
+authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
+edition = "2018"
+
+[dependencies]
+enr = "0.1.0-alpha"
+ethereum-types = "*"
+heapless = "0.5"
+rand = "0.7"
+tokio = { version = "0.2", features = ["full"] }
