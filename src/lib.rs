@@ -138,7 +138,7 @@ impl<K: EnrKey> NodeTable<K> {
 pub struct NodeEntries<'a, K: EnrKey> {
     node_table: &'a mut NodeTable<K>,
     current_bucket: usize,
-    current_bucket_remaining: Option<Vec<&'a mut NodeEntry<K>>>,
+    current_bucket_remaining: Option<Vec<*mut NodeEntry<K>>>,
 }
 
 impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
@@ -161,15 +161,13 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
                     let nodes = node_table.buckets[*current_bucket]
                         .nodes
                         .values_mut()
-                        .map(|value| unsafe {
-                            std::mem::transmute::<&mut NodeEntry<K>, &'a mut NodeEntry<K>>(value)
-                        })
+                        .map(|value| &mut *value as *mut _)
                         .collect::<Vec<_>>();
                     nodes
                 })
                 .pop()
             {
-                return Some(v);
+                return Some(unsafe { v.as_mut().unwrap() });
             }
 
             *current_bucket += 1;
