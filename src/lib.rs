@@ -5,12 +5,20 @@ use arr_macro::arr;
 use derivative::Derivative;
 use enr::*;
 use ethereum_types::*;
+use futures::{stream::StreamExt, Sink, SinkExt};
 use heapless::{
     consts::{U16, U4096},
     FnvIndexMap,
 };
 use log::*;
-use std::{ops::BitXor, ptr::NonNull, time::Instant};
+use std::{
+    collections::HashSet,
+    ops::BitXor,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+use tokio::stream::*;
 
 type RawNodeId = [u8; 32];
 
@@ -244,6 +252,96 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
             *current_bucket += 1;
             *current_bucket_remaining = None;
             *next_yield = 0;
+        }
+    }
+}
+
+pub enum DiscoveryRequest {
+    Ping,
+}
+
+pub enum DiscoveryResponse {
+    Pong,
+}
+
+#[allow(dead_code)]
+pub struct Discovery<K: EnrKey> {
+    node_table: Arc<Mutex<NodeTable<K>>>,
+    concurrency: usize,
+}
+
+impl<K: EnrKey + Send + 'static> Discovery<K> {
+    pub fn new<Io>(io: Io, host_id: H256) -> Self
+    where
+        Io: Stream<Item = (H256, DiscoveryResponse)>
+            + Sink<(H256, DiscoveryRequest)>
+            + Send
+            + 'static,
+    {
+        let (mut io_tx, mut io_rx) = io.split();
+        let node_table = Arc::new(Mutex::new(NodeTable::new(host_id)));
+
+        // Ougoing router
+        let (outgoing_sender, mut rx) = tokio::sync::mpsc::channel::<(H256, DiscoveryRequest)>(1);
+        tokio::spawn(async move {
+            while let Some((node_id, request)) = rx.next().await {
+                let _ = io_tx.send((node_id, request)).await;
+            }
+        });
+
+        // Liveness check service
+        let unanswered_pings = Arc::new(Mutex::new(HashSet::<H256>::new()));
+        tokio::spawn({
+            let node_table = node_table.clone();
+            let unanswered_pings = unanswered_pings.clone();
+            async move {
+                const PING_TIMEOUT: u64 = 10;
+                const SAMPLE_SIZE: usize = 5;
+
+                loop {
+                    let mut t = node_table.lock().unwrap();
+                    let sample = (0..SAMPLE_SIZE)
+                        .filter_map(|_| {
+                            t.random_node()
+                                .map(|entry| H256(entry.record.node_id().raw()))
+                        })
+                        .filter(|node| !unanswered_pings.lock().unwrap().contains(node))
+                        .collect::<HashSet<_>>();
+
+                    for node in sample {
+                        let mut outgoing_sender = outgoing_sender.clone();
+                        let node_table = node_table.clone();
+                        let unanswered_pings = unanswered_pings.clone();
+                        tokio::spawn(async move {
+                            let _ = outgoing_sender.send((node, DiscoveryRequest::Ping)).await;
+
+                            tokio::time::delay_for(std::time::Duration::from_secs(PING_TIMEOUT))
+                                .await;
+
+                            let mut t = node_table.lock().unwrap();
+                            if unanswered_pings.lock().unwrap().remove(&node) {
+                                t.evict_node(node);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        // Incoming router
+        tokio::spawn(async move {
+            while let Some((node_id, response)) = io_rx.next().await {
+                match response {
+                    DiscoveryResponse::Pong => {
+                        unanswered_pings.lock().unwrap().remove(&node_id);
+                    }
+                }
+            }
+        });
+
+        Self {
+            node_table,
+            concurrency: 3,
         }
     }
 }
