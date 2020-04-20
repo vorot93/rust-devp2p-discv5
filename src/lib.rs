@@ -1,3 +1,6 @@
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![allow(clippy::default_trait_access, clippy::use_self)]
+
 use arr_macro::arr;
 use derivative::Derivative;
 use enr::*;
@@ -11,10 +14,12 @@ use std::{ops::BitXor, ptr::NonNull, time::Instant};
 
 type RawNodeId = [u8; 32];
 
+#[must_use]
 pub fn distance(a: H256, b: H256) -> U256 {
     U256::from_big_endian(&a.bitxor(b).0)
 }
 
+#[must_use]
 pub fn logdistance(a: H256, b: H256) -> Option<usize> {
     for i in (0..H256::len_bytes()).rev() {
         let byte_index = H256::len_bytes() - i - 1;
@@ -42,23 +47,24 @@ struct Bucket<K: EnrKey> {
 }
 
 pub struct NodeTable<K: EnrKey> {
-    node_id: H256,
+    host_id: H256,
     buckets: Box<[Bucket<K>; 256]>,
 
     all_nodes: Box<heapless::FnvIndexSet<RawNodeId, U4096>>,
 }
 
 impl<K: EnrKey> NodeTable<K> {
+    #[must_use]
     pub fn new(host_id: H256) -> Self {
         Self {
-            node_id: host_id,
+            host_id,
             buckets: Box::new(arr![Default::default(); 256]),
             all_nodes: Default::default(),
         }
     }
 
     fn bucket_idx(&self, node_id: H256) -> Option<usize> {
-        logdistance(self.node_id, node_id)
+        logdistance(self.host_id, node_id)
     }
 
     fn bucket(&mut self, node_id: H256) -> Option<&mut Bucket<K>> {
@@ -140,28 +146,48 @@ impl<K: EnrKey> NodeTable<K> {
         )
     }
 
-    pub fn bucket_nodes(&mut self, logdistance: u8) -> NodeEntries<'_, K> {
-        NodeEntries {
+    pub fn bucket_nodes(&mut self, logdistance: u8) -> BucketNodes<'_, K> {
+        BucketNodes(NodeEntries {
             node_table: self,
             current_bucket: logdistance as usize,
             max_bucket: logdistance as usize,
             current_bucket_remaining: None,
             next_yield: 0,
-        }
+        })
     }
 
-    pub fn closest(&mut self) -> NodeEntries<'_, K> {
-        NodeEntries {
+    pub fn closest(&mut self) -> Closest<'_, K> {
+        Closest(NodeEntries {
             node_table: self,
             current_bucket: 0,
             max_bucket: 255,
             current_bucket_remaining: None,
             next_yield: 0,
-        }
+        })
     }
 }
 
-pub struct NodeEntries<'a, K: EnrKey> {
+pub struct BucketNodes<'a, K: EnrKey>(NodeEntries<'a, K>);
+
+impl<'a, K: EnrKey> Iterator for BucketNodes<'a, K> {
+    type Item = &'a mut NodeEntry<K>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+pub struct Closest<'a, K: EnrKey>(NodeEntries<'a, K>);
+
+impl<'a, K: EnrKey> Iterator for Closest<'a, K> {
+    type Item = &'a mut NodeEntry<K>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+struct NodeEntries<'a, K: EnrKey> {
     node_table: &'a mut NodeTable<K>,
     current_bucket: usize,
     max_bucket: usize,
@@ -182,13 +208,9 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
                 next_yield,
             } = self;
 
-            if *current_bucket > *max_bucket {
-                return None;
-            }
-
             trace!("Current bucket is {}", *current_bucket);
 
-            let host_id = node_table.node_id;
+            let host_id = node_table.host_id;
 
             if let Some(ptr) = current_bucket_remaining
                 .get_or_insert_with(|| {
@@ -211,7 +233,12 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
                 .get_mut(*next_yield)
             {
                 *next_yield += 1;
+                // Safety: we have exclusive access to underlying node table
                 return Some(unsafe { &mut *ptr.as_ptr() });
+            }
+
+            if *current_bucket == *max_bucket {
+                return None;
             }
 
             *current_bucket += 1;
@@ -227,7 +254,7 @@ mod tests {
     use secp256k1::SecretKey;
     #[test]
     fn test_iterator() {
-        let _ = env_logger::init();
+        let _ = env_logger::try_init();
         let host_id = H256::random();
         let mut table = NodeTable::<SecretKey>::new(host_id);
 
