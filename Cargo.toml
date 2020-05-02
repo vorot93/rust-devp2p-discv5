@@ -6,14 +6,20 @@ edition = "2018"
 
 [dependencies]
 arr_macro = "*"
-derivative = "1"
+bytes = "0.5"
+derivative = "2"
+digest = "*"
 enr = "0.1.0-alpha"
-ethereum-types = "*"
+ethereum-types = "0.9"
 futures = "0.3"
 heapless = "0.5"
 log = "*"
 rand = "0.7"
+rlp = "0.4"
+rlp-derive = "0.1"
+sha2 = "0.8"
 tokio = { version = "0.2", features = ["full"] }
+tokio-util = { version = "0.3", features = ["codec", "udp"] }
 
 [dev-dependencies]
 env_logger = "*"

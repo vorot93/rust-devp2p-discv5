@@ -1,26 +1,40 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::default_trait_access, clippy::use_self)]
+#![allow(
+    clippy::default_trait_access,
+    clippy::use_self,
+    clippy::wildcard_imports
+)]
 
 use arr_macro::arr;
 use derivative::Derivative;
 use enr::*;
 use ethereum_types::*;
-use futures::{stream::StreamExt, Sink, SinkExt};
+use futures::{Sink, SinkExt};
 use heapless::{
     consts::{U16, U4096},
     FnvIndexMap,
 };
 use log::*;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
+    future::Future,
+    net::SocketAddr,
     ops::BitXor,
     ptr::NonNull,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::stream::*;
+use tokio::{
+    net::UdpSocket,
+    prelude::*,
+    stream::{StreamExt, *},
+};
+use tokio_util::{codec::*, udp::*};
 
-type RawNodeId = [u8; 32];
+pub mod proto;
+pub mod topic;
+
+pub type RawNodeId = [u8; 32];
 
 #[must_use]
 pub fn distance(a: H256, b: H256) -> U256 {
@@ -40,10 +54,17 @@ pub fn logdistance(a: H256, b: H256) -> Option<usize> {
     None // a and b are equal, so log distance is -inf
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum PeerState {
+    New,
+    Ready,
+}
+
 #[derive(Derivative)]
 #[derivative(Debug(bound = ""))]
 pub struct NodeEntry<K: EnrKey> {
     pub record: Enr<K>,
+    pub peer_state: PeerState,
     pub liveness: Option<Instant>,
 }
 
@@ -71,6 +92,16 @@ impl<K: EnrKey> NodeTable<K> {
         }
     }
 
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.all_nodes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn bucket_idx(&self, node_id: H256) -> Option<usize> {
         logdistance(self.host_id, node_id)
     }
@@ -84,7 +115,7 @@ impl<K: EnrKey> NodeTable<K> {
         bucket.nodes.get_mut(&node_id.0)
     }
 
-    pub fn add_node(&mut self, record: Enr<K>) {
+    pub fn add_node(&mut self, record: Enr<K>, peer_state: PeerState) {
         let node_id = H256(record.node_id().raw());
 
         // If we don't have such node already...
@@ -101,6 +132,7 @@ impl<K: EnrKey> NodeTable<K> {
                         node_id,
                         NodeEntry {
                             record,
+                            peer_state,
                             liveness: None,
                         },
                     );
@@ -128,6 +160,7 @@ impl<K: EnrKey> NodeTable<K> {
                         node_id,
                         NodeEntry {
                             record,
+                            peer_state: PeerState::New,
                             liveness: None,
                         },
                     );
@@ -160,7 +193,6 @@ impl<K: EnrKey> NodeTable<K> {
             current_bucket: logdistance as usize,
             max_bucket: logdistance as usize,
             current_bucket_remaining: None,
-            next_yield: 0,
         })
     }
 
@@ -170,7 +202,6 @@ impl<K: EnrKey> NodeTable<K> {
             current_bucket: 0,
             max_bucket: 255,
             current_bucket_remaining: None,
-            next_yield: 0,
         })
     }
 }
@@ -200,7 +231,6 @@ struct NodeEntries<'a, K: EnrKey> {
     current_bucket: usize,
     max_bucket: usize,
     current_bucket_remaining: Option<Vec<NonNull<NodeEntry<K>>>>,
-    next_yield: usize,
 }
 
 impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
@@ -213,7 +243,6 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
                 current_bucket,
                 max_bucket,
                 current_bucket_remaining,
-                next_yield,
             } = self;
 
             trace!("Current bucket is {}", *current_bucket);
@@ -230,17 +259,16 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
                     trace!("Nodes before sorting: {:?}", nodes);
 
                     nodes.sort_by(|a, b| {
-                        distance(host_id, H256(a.record.node_id().raw()))
-                            .cmp(&distance(host_id, H256(b.record.node_id().raw())))
+                        distance(host_id, H256(b.record.node_id().raw()))
+                            .cmp(&distance(host_id, H256(a.record.node_id().raw())))
                     });
 
                     trace!("Nodes after sorting: {:?}", nodes);
 
                     nodes.into_iter().map(From::from).collect()
                 })
-                .get_mut(*next_yield)
+                .pop()
             {
-                *next_yield += 1;
                 // Safety: we have exclusive access to underlying node table
                 return Some(unsafe { &mut *ptr.as_ptr() });
             }
@@ -251,7 +279,6 @@ impl<'a, K: EnrKey> Iterator for NodeEntries<'a, K> {
 
             *current_bucket += 1;
             *current_bucket_remaining = None;
-            *next_yield = 0;
         }
     }
 }
@@ -264,6 +291,18 @@ pub enum DiscoveryResponse {
     Pong,
 }
 
+pub enum DiscoveryPacket {
+    WhoAreYou,
+    FindNode,
+    Ping,
+    Pong,
+}
+
+pub enum TableUpdate {
+    Added { node_id: H256, addr: SocketAddr },
+    Removed { node_id: H256 },
+}
+
 #[allow(dead_code)]
 pub struct Discovery<K: EnrKey> {
     node_table: Arc<Mutex<NodeTable<K>>>,
@@ -271,23 +310,31 @@ pub struct Discovery<K: EnrKey> {
 }
 
 impl<K: EnrKey + Send + 'static> Discovery<K> {
-    pub fn new<Io>(io: Io, host_id: H256) -> Self
-    where
-        Io: Stream<Item = (H256, DiscoveryResponse)>
-            + Sink<(H256, DiscoveryRequest)>
-            + Send
-            + 'static,
-    {
-        let (mut io_tx, mut io_rx) = io.split();
+    pub async fn new<
+        F: Fn(TableUpdate) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send,
+    >(
+        addr: String,
+        host_id: H256,
+        on_table_update: F,
+    ) -> Self {
+        let socket = UdpSocket::bind(addr).await.unwrap();
+        let on_table_update = Arc::new(on_table_update);
+
+        // Create a node table
         let node_table = Arc::new(Mutex::new(NodeTable::new(host_id)));
 
+        let (tx, mut rx) = futures::StreamExt::split(UdpFramed::new(socket, BytesCodec::new()));
         // Ougoing router
-        let (outgoing_sender, mut rx) = tokio::sync::mpsc::channel::<(H256, DiscoveryRequest)>(1);
-        tokio::spawn(async move {
-            while let Some((node_id, request)) = rx.next().await {
-                let _ = io_tx.send((node_id, request)).await;
-            }
-        });
+        let (outgoing_sender, mut rx) = tokio::sync::mpsc::channel::<(H256, DiscoveryPacket)>(1);
+        // tokio::spawn(async move {
+        //     while let Some((node_id, request)) = rx.next().await {
+        //         if let Some(node) = node_table.lock().unwrap().node_mut(node_id) {
+        //             if let Some(ip) = node.record.ip() {}
+        //         }
+        //         let _ = io_tx.send((node_id, request)).await;
+        //     }
+        // });
 
         // Liveness check service
         let unanswered_pings = Arc::new(Mutex::new(HashSet::<H256>::new()));
@@ -296,48 +343,57 @@ impl<K: EnrKey + Send + 'static> Discovery<K> {
             let unanswered_pings = unanswered_pings.clone();
             async move {
                 const PING_TIMEOUT: u64 = 10;
-                const SAMPLE_SIZE: usize = 5;
+                const SCAN_IN: u64 = 30_000;
 
                 loop {
-                    let mut t = node_table.lock().unwrap();
-                    let sample = (0..SAMPLE_SIZE)
-                        .filter_map(|_| {
-                            t.random_node()
-                                .map(|entry| H256(entry.record.node_id().raw()))
-                        })
-                        .filter(|node| !unanswered_pings.lock().unwrap().contains(node))
-                        .collect::<HashSet<_>>();
+                    let d = {
+                        let node_id = node_table
+                            .lock()
+                            .unwrap()
+                            .random_node()
+                            .map(|entry| H256(entry.record.node_id().raw()))
+                            .filter(|node| !unanswered_pings.lock().unwrap().contains(node));
 
-                    for node in sample {
-                        let mut outgoing_sender = outgoing_sender.clone();
-                        let node_table = node_table.clone();
-                        let unanswered_pings = unanswered_pings.clone();
-                        tokio::spawn(async move {
-                            let _ = outgoing_sender.send((node, DiscoveryRequest::Ping)).await;
+                        if let Some(node_id) = node_id {
+                            let mut outgoing_sender = outgoing_sender.clone();
+                            let on_table_update = on_table_update.clone();
+                            let node_table = node_table.clone();
+                            let unanswered_pings = unanswered_pings.clone();
+                            tokio::spawn(async move {
+                                let _ =
+                                    outgoing_sender.send((node_id, DiscoveryPacket::Ping)).await;
 
-                            tokio::time::delay_for(std::time::Duration::from_secs(PING_TIMEOUT))
+                                tokio::time::delay_for(std::time::Duration::from_secs(
+                                    PING_TIMEOUT,
+                                ))
                                 .await;
 
-                            let mut t = node_table.lock().unwrap();
-                            if unanswered_pings.lock().unwrap().remove(&node) {
-                                t.evict_node(node);
-                            }
-                        });
-                    }
+                                if unanswered_pings.lock().unwrap().remove(&node_id) {
+                                    node_table.lock().unwrap().evict_node(node_id);
+                                    (on_table_update)(TableUpdate::Removed { node_id }).await;
+                                }
+                            });
+                        }
+                        tokio::time::delay_for(Duration::from_millis(
+                            SCAN_IN / node_table.lock().unwrap().len() as u64,
+                        ))
+                    };
+
+                    d.await;
                 }
             }
         });
 
         // Incoming router
-        tokio::spawn(async move {
-            while let Some((node_id, response)) = io_rx.next().await {
-                match response {
-                    DiscoveryResponse::Pong => {
-                        unanswered_pings.lock().unwrap().remove(&node_id);
-                    }
-                }
-            }
-        });
+        // tokio::spawn(async move {
+        //     while let Some((node_id, response)) = io_rx.next().await {
+        //         match response {
+        //             DiscoveryResponse::Pong => {
+        //                 unanswered_pings.lock().unwrap().remove(&node_id);
+        //             }
+        //         }
+        //     }
+        // });
 
         Self {
             node_table,
@@ -361,6 +417,7 @@ mod tests {
                 EnrBuilder::new("v4")
                     .build(&SecretKey::random(&mut rand::thread_rng()))
                     .unwrap(),
+                PeerState::Ready,
             )
         }
 
